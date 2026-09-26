@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Auto-login for the IISER Bhopal FortiGate captive portal.
+#
+# Credentials (optional, for unattended use) go in ~/.config/iiser-login/credentials:
+#     IISER_USER='yourname'
+#     IISER_PASS='yourpassword'
+# then: chmod 600 ~/.config/iiser-login/credentials
+#
+# Usage: iiser-login            # log in once (prompts if no credentials file)
+#        iiser-login --watch    # keep checking every 60 s and re-login when needed
+
+set -u
+
+PROBE_URL="http://detectportal.firefox.com/success.txt"   # same check Firefox uses
+CRED_FILE="${IISER_CRED_FILE:-$HOME/.config/iiser-login/credentials}"
+LOG_FILE="${IISER_LOG:-$HOME/.cache/iiser-login.log}"
+UA="Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
+mkdir -p "$(dirname "$LOG_FILE")"
+log() { echo "$(date '+%F %T') - $*" | tee -a "$LOG_FILE" >&2; }
+
+# ---- credentials / settings ---------------------------------------------
+[ -r "$CRED_FILE" ] && . "$CRED_FILE"
+IISER_USER="${IISER_USER:-}"; IISER_PASS="${IISER_PASS:-}"
+
+# -sS: quiet, but still print errors (e.g. certificate failures) to the log
+CURL=(curl -4 -sS -m 15 -A "$UA")       # -4: the portal usually only intercepts IPv4
+# Portal is reached by IP, so its certificate won't match. Default: skip the check.
+[ "${IISER_INSECURE:-1}" = 1 ] && CURL+=(-k)
+
+need_creds() {
+    if [ -z "$IISER_USER" ]; then read -rp "Username: " IISER_USER; fi
+    if [ -z "$IISER_PASS" ]; then read -rsp "Password: " IISER_PASS; echo; fi
+}
+
+# ---- helpers -------------------------------------------------------------
+online() {
+    [ "$("${CURL[@]}" "$PROBE_URL" 2>/dev/null | tr -d '\r\n')" = "success" ]
+}
+
+login() {
+    # 1. Probe: an intercepted request returns either a Location header or a
+    #    JS/meta redirect pointing at .../fgtauth?<magic>
+    local probe auth_url origin jar page magic redir resp
+    probe=$("${CURL[@]}" -D - "$PROBE_URL")
+
+    if [ "$(printf '%s' "$probe" | tail -n1 | tr -d '\r')" = "success" ]; then
+        log "Already online."
+        return 0
+    fi
+
+    auth_url=$(printf '%s' "$probe" \
+        | grep -oP 'https?://[^"'"'"'\s<>]+/fgtauth\?[^"'"'"'\s<>&]+' | head -n1)
+
+    if [ -z "$auth_url" ]; then
+        log "No portal redirect found. Raw probe response saved to log."
+        printf '%s\n' "$probe" >> "$LOG_FILE"
+        return 1
+    fi
+    origin=$(grep -oP '^https?://[^/]+' <<<"$auth_url")
+    log "Portal: $auth_url"
+
+    # 2. Fetch the login page (keeps cookies, reads the form's hidden fields)
+    jar=$(mktemp); trap 'rm -f "$jar"' RETURN
+    page=$("${CURL[@]}" -c "$jar" -b "$jar" "$auth_url" 2>>"$LOG_FILE")
+    magic=$(grep -oP 'name="magic"\s+value="\K[^"]+' <<<"$page" | head -n1)
+    redir=$(grep -oP 'name="4Tredir"\s+value="\K[^"]+' <<<"$page" | head -n1)
+    [ -z "$magic" ] && magic="${auth_url#*fgtauth\?}"     # fall back to the URL
+    [ -z "$redir" ] && redir="$PROBE_URL"
+    log "Magic: $magic"
+
+    # 3. Submit (--data-urlencode handles special characters in the password)
+    need_creds
+    resp=$("${CURL[@]}" -b "$jar" -c "$jar" -X POST "$origin/" 2>>"$LOG_FILE" \
+        -H "Origin: $origin" -H "Referer: $auth_url" \
+        --data-urlencode "4Tredir=$redir" \
+        --data-urlencode "magic=$magic" \
+        --data-urlencode "username=$IISER_USER" \
+        --data-urlencode "password=$IISER_PASS")
+
+    # 4. Verify
+    sleep 1
+    if online; then
+        log "Login successful."
+        ka=$(grep -oP 'https?://[^"'"'"'\s<>]+/keepalive\?[^"'"'"'\s<>]+' <<<"$resp" | head -n1)
+        if [ -n "$ka" ]; then KEEPALIVE="$ka"; log "Keepalive URL: $ka"; fi
+        return 0
+    fi
+    log "Login failed. Portal response saved to log."
+    printf '%s\n' "$resp" >> "$LOG_FILE"
+    return 1
+}
+
+# ---- main ----------------------------------------------------------------
+if [ "${1:-}" = "--watch" ]; then
+    need_creds
+    KEEPALIVE=""
+    log "Watch mode started."
+    while true; do
+        if online; then
+            # Refresh the portal session so it doesn't time out
+            [ -n "$KEEPALIVE" ] && "${CURL[@]}" -o /dev/null "$KEEPALIVE" 2>>"$LOG_FILE"
+        else
+            log "Offline - logging in again."
+            login
+        fi
+        sleep 60
+    done
+else
+    login
+fi
