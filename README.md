@@ -29,7 +29,7 @@ sudo apt install curl
 **1. Get the script**
 
 ```bash
-git clone https://github.com/<your-username>/iiser-login.git
+git clone https://github.com/karthiknambiar29/iiser-login.git
 cd iiser-login
 ```
 
